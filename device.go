@@ -3,7 +3,9 @@ package adb
 import (
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -86,6 +88,7 @@ func (c *Device) DeviceInfo() (*DeviceInfo, error) {
 RunCommand runs the specified commands on a shell on the device.
 
 From the Android docs:
+
 	Run 'command arg1 arg2 ...' in a shell on the device, and return
 	its output and error streams. Note that arguments must be separated
 	by spaces. If an argument contains a space, it must be quoted with
@@ -93,6 +96,7 @@ From the Android docs:
 	will go very wrong.
 
 	Note that this is the non-interactive version of "adb shell"
+
 Source: https://android.googlesource.com/platform/system/core/+/master/adb/SERVICES.TXT
 
 This method quotes the arguments for you, and will return an error if any of them
@@ -125,14 +129,258 @@ func (c *Device) RunCommand(cmd string, args ...string) (string, error) {
 	resp, err := conn.ReadUntilEof()
 	return string(resp), wrapClientError(err, c, "RunCommand")
 }
+func (c *Device) RunCommandWithShell(cmd string, args ...string) (*wire.Conn, error) {
+	cmd, err := prepareCommandLine(cmd, args...)
+	if err != nil {
+		return nil, wrapClientError(err, c, "RunCommand")
+	}
+
+	conn, err := c.dialDevice()
+	if err != nil {
+		return nil, wrapClientError(err, c, "RunCommand")
+	}
+
+	req := fmt.Sprintf("shell:%s", cmd)
+
+	// Shell responses are special, they don't include a length header.
+	// We read until the stream is closed.
+	// So, we can't use conn.RoundTripSingleResponse.
+	if err = conn.SendMessage([]byte(req)); err != nil {
+		return nil, wrapClientError(err, c, "RunCommand")
+	}
+	if _, err = conn.ReadStatus(req); err != nil {
+		return nil, wrapClientError(err, c, "RunCommand")
+	}
+
+	return conn, wrapClientError(err, c, "RunCommand")
+}
+
+func (c *Device) CreateDeviceConnection() (*wire.Conn, error) {
+	return c.dialDevice()
+}
+
+func (c *Device) DialLocalAbstractSocket(socketName string) (*wire.Conn, error) {
+	conn, err := c.dialDevice()
+	if err != nil {
+		return nil, wrapClientError(err, c, "DialSocket")
+	}
+	req := fmt.Sprintf("localabstract:%s", socketName)
+	if err = conn.SendMessage([]byte(req)); err != nil {
+		return nil, wrapClientError(err, c, "DialSocket")
+	}
+	if _, err = conn.ReadStatus(req); err != nil {
+		return nil, wrapClientError(err, c, "DialSocket")
+	}
+
+	return conn, nil
+}
+
+func (c *Device) Push(data []byte, remotePath string) error {
+	slashPath := filepath.ToSlash(remotePath)
+	if strings.HasSuffix(slashPath, "/") {
+		return fmt.Errorf("file name not set")
+	}
+
+	writer, err := c.OpenWrite(slashPath, os.ModePerm, time.Now())
+	if err != nil {
+		return wrapClientError(err, c, "Push")
+	}
+	defer writer.Close()
+	_, err = writer.Write(data)
+	time.Sleep(1 * time.Second)
+	return wrapClientError(err, c, "Push")
+}
+
+func (c *Device) PushFile(localPath, remotePath string) error {
+	file, err := os.ReadFile(localPath)
+
+	if err != nil {
+		return err
+	}
+
+	lastByte := remotePath[len(remotePath)-1]
+	if lastByte == '/' || lastByte == '\\' {
+		remotePath = filepath.Join(remotePath, filepath.Base(localPath))
+	}
+
+	return c.Push(file, remotePath)
+}
+
+func (c *Device) Pull(remotePath string) ([]byte, error) {
+	reader, err := c.OpenRead(filepath.ToSlash(remotePath))
+	if err != nil {
+		return nil, wrapClientError(err, c, "Pull")
+	}
+	defer func() {
+		_ = reader.Close()
+	}()
+	return io.ReadAll(reader)
+}
+
+func (c *Device) PullFile(remotePath, localPath string) error {
+	reader, err := c.OpenRead(filepath.ToSlash(remotePath))
+	if err != nil {
+		return wrapClientError(err, c, "Pull")
+	}
+	defer func() {
+		_ = reader.Close()
+	}()
+
+	localDir := filepath.Dir(localPath)
+	if _, err := os.Stat(localDir); os.IsNotExist(err) {
+		if err := os.MkdirAll(localDir, os.ModePerm); err != nil {
+			return err
+		}
+	}
+
+	localInfo, err := os.Stat(localPath)
+	if err == nil && localInfo.IsDir() {
+		localPath = filepath.Join(localPath, filepath.Base(remotePath))
+	}
+
+	file, err := os.Create(localPath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+
+	_, err = io.Copy(file, reader)
+	return err
+
+}
+
+func (c *Device) install(apkPath string, args ...string) error {
+	args = append(append([]string{"install"}, args...), apkPath)
+
+	res, err := c.RunCommand("pm", args...)
+
+	if err != nil {
+		return err
+	}
+	slog.Info(fmt.Sprintf("[adb_install]install apk:%s", filepath.Base(apkPath)), "res", res)
+	return nil
+}
+
+func (c *Device) Install(data []byte, apkName string, args ...string) error {
+	tmpPath := "/data/local/tmp/"
+	apkPath := filepath.ToSlash(filepath.Join(tmpPath, apkName))
+	if err := c.Push(data, apkPath); err != nil {
+		return err
+	}
+
+	return c.install(apkPath, args...)
+}
+
+func (c *Device) InstallAPK(filePath string, args ...string) error {
+	tmpPath := "/data/local/tmp/"
+	if err := c.PushFile(filePath, tmpPath); err != nil {
+		return err
+	}
+	fileName := filepath.Base(filePath)
+	apkPath := filepath.ToSlash(filepath.Join(tmpPath, fileName))
+
+	return c.install(apkPath, args...)
+}
+
+func (c *Device) Uninstall(packageName string) error {
+	res, err := c.RunCommand("pm", "uninstall", packageName)
+
+	if err != nil {
+		return err
+	}
+	slog.Info(fmt.Sprintf("[adb_uninstall]uninstall package:%s", packageName), "res", res)
+	return nil
+}
+
+func (c *Device) Forward(local, remote string, noRebind bool) error {
+	cmd := ""
+	serial, err := c.Serial()
+	if err != nil {
+		return err
+	}
+	if noRebind {
+		cmd = fmt.Sprintf("host-serial:%s:forward:norebind:%s;%s", serial, local, remote)
+	} else {
+		cmd = fmt.Sprintf("host-serial:%s:forward:%s;%s", serial, local, remote)
+	}
+	conn, err := c.dialDevice()
+	if err != nil {
+		return wrapClientError(err, c, "Forward")
+	}
+	defer conn.Close()
+
+	if err = conn.SendMessage([]byte(cmd)); err != nil {
+		return wrapClientError(err, c, "Forward")
+	}
+	if _, err := conn.ReadStatus(cmd); err != nil {
+		return wrapClientError(err, c, "Forward")
+	}
+	return nil
+}
+
+func (c *Device) ForwardKill(local string) error {
+	serial, err := c.Serial()
+	if err != nil {
+		return err
+	}
+	conn, err := c.dialDevice()
+	if err != nil {
+		return wrapClientError(err, c, "ForwardKill")
+	}
+	cmd := fmt.Sprintf("host-serial:%s:killforward:%s", serial, local)
+	if err = conn.SendMessage([]byte(cmd)); err != nil {
+		return wrapClientError(err, c, "ForwardKill")
+	}
+	if _, err := conn.ReadStatus(cmd); err != nil {
+		return wrapClientError(err, c, "ForwardKill")
+	}
+	return nil
+}
+
+func (c *Device) ForwardKillAll() error {
+	list, err := c.ForwardList()
+	if err != nil {
+		return err
+	}
+	var res error = nil
+	for _, info := range list {
+		err := c.ForwardKill(info.Local)
+		if err != nil {
+			res = err
+		}
+	}
+	return res
+}
+
+func (c *Device) ForwardList() ([]ForwardInfo, error) {
+	serial, err := c.Serial()
+	if err != nil {
+		return nil, err
+	}
+	conn, err := c.dialDevice()
+	if err != nil {
+		return nil, wrapClientError(err, c, "ForwardList")
+	}
+	cmd := fmt.Sprintf("host-serial:%s:list-forward", serial)
+	resp, err := conn.RoundTripSingleResponse([]byte(cmd))
+	if err != nil {
+		return nil, wrapClientError(err, c, "ForwardList")
+	}
+	forwardInfos := parseForwardInfo(resp)
+	return forwardInfos, nil
+}
 
 /*
 Remount, from the official adb command’s docs:
+
 	Ask adbd to remount the device's filesystem in read-write mode,
 	instead of read-only. This is usually necessary before performing
 	an "adb sync" or "adb push" request.
 	This request may not succeed on certain builds which do not allow
 	that.
+
 Source: https://android.googlesource.com/platform/system/core/+/master/adb/SERVICES.TXT
 */
 func (c *Device) Remount() (string, error) {

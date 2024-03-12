@@ -13,11 +13,17 @@ type Sender interface {
 
 	NewSyncSender() SyncSender
 
+	GetWriter() io.Writer
+
 	Close() error
 }
 
 type realSender struct {
 	writer io.WriteCloser
+}
+
+func (s *realSender) GetWriter() io.Writer {
+	return s.writer
 }
 
 func NewSender(w io.WriteCloser) Sender {

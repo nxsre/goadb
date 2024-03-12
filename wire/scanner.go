@@ -43,10 +43,16 @@ type Scanner interface {
 	ReadUntilEof() ([]byte, error)
 
 	NewSyncScanner() SyncScanner
+
+	GetReader() io.Reader
 }
 
 type realScanner struct {
 	reader io.ReadCloser
+}
+
+func (s *realScanner) GetReader() io.Reader {
+	return s.reader
 }
 
 func NewScanner(r io.ReadCloser) Scanner {

@@ -75,6 +75,7 @@ func (c *Adb) ServerVersion() (int, error) {
 KillServer tells the server to quit immediately.
 
 Corresponds to the command:
+
 	adb kill-server
 */
 func (c *Adb) KillServer() error {
@@ -95,6 +96,7 @@ func (c *Adb) KillServer() error {
 ListDeviceSerials returns the serial numbers of all attached devices.
 
 Corresponds to the command:
+
 	adb devices
 */
 func (c *Adb) ListDeviceSerials() ([]string, error) {
@@ -119,6 +121,7 @@ func (c *Adb) ListDeviceSerials() ([]string, error) {
 ListDevices returns the list of connected devices.
 
 Corresponds to the command:
+
 	adb devices -l
 */
 func (c *Adb) ListDevices() ([]*DeviceInfo, error) {
@@ -138,6 +141,7 @@ func (c *Adb) ListDevices() ([]*DeviceInfo, error) {
 Connect connect to a device via TCP/IP
 
 Corresponds to the command:
+
 	adb connect
 */
 func (c *Adb) Connect(host string, port int) error {
@@ -145,6 +149,36 @@ func (c *Adb) Connect(host string, port int) error {
 	if err != nil {
 		return wrapClientError(err, c, "Connect")
 	}
+	return nil
+}
+
+func (c *Adb) DisConnect(host string, port int) error {
+	_, err := roundTripSingleResponse(c.server, fmt.Sprintf("host:disconnect:%s:%d", host, port))
+	if err != nil {
+		return wrapClientError(err, c, "DisConnect")
+	}
+	return nil
+}
+
+func (c *Adb) ForwardList() ([]ForwardInfo, error) {
+	resp, err := roundTripSingleResponse(c.server, "host:list-forward")
+	if err != nil {
+		return nil, wrapClientError(err, c, "ForwardList")
+	}
+	forwardInfos := parseForwardInfo(resp)
+	return forwardInfos, nil
+}
+func (c *Adb) ForwardKillAll() error {
+	conn, err := c.server.Dial()
+	if err != nil {
+		return wrapClientError(err, c, "ForwardKillAll")
+	}
+	defer conn.Close()
+
+	if err = wire.SendMessageString(conn, "host:killforward-all"); err != nil {
+		return wrapClientError(err, c, "ForwardKillAll")
+	}
+
 	return nil
 }
 

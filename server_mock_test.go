@@ -28,6 +28,10 @@ type MockServer struct {
 	Trace []string
 }
 
+func (s *MockServer) GetWriter() io.Writer {
+	return nil
+}
+
 var _ server = &MockServer{}
 
 func (s *MockServer) Dial() (*wire.Conn, error) {
@@ -101,6 +105,10 @@ func (s *MockServer) Close() error {
 	if err := s.getNextErrToReturn(); err != nil {
 		return err
 	}
+	return nil
+}
+
+func (s *MockServer) GetReader() io.Reader {
 	return nil
 }
 
